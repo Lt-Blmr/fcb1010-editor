@@ -6,12 +6,21 @@ This module provides classes and functions to read, write, and edit presets for 
 
 import rtmidi
 import logging
+import time
+from typing import List, Optional, Dict, Any
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# FCB1010 SysEx constants
+SYSEX_START = 0xF0
+SYSEX_END = 0xF7
+FCB1010_MANUFACTURER_ID = [0x00, 0x20, 0x29]  # Behringer
+FCB1010_DEVICE_ID = 0x02
+FCB1010_MODEL_ID = 0x0C
 
 
 class FCB1010:
@@ -92,6 +101,10 @@ class FCB1010:
         # Current preset
         self.current_preset = None
 
+        # Sysex response storage
+        self._sysex_responses = []
+        self._sysex_timeout = 2.0  # seconds
+
     def _midi_callback(self, message, time_stamp):
         """
         Callback function for MIDI messages.
@@ -103,11 +116,16 @@ class FCB1010:
         logger.debug(f"MIDI message received: {message} at {time_stamp}")
         # Process MIDI message here
         if len(message) > 0:
-            status = message[0][0] & 0xF0  # Extract status byte
-            if status == 0xC0:  # Program Change
-                preset_num = message[0][1]
-                logger.info(f"Program Change: Preset {preset_num}")
-                self.current_preset = preset_num
+            msg_data = message[0]
+            if len(msg_data) > 0:
+                status = msg_data[0] & 0xF0  # Extract status byte
+                if status == 0xC0:  # Program Change
+                    preset_num = msg_data[1]
+                    logger.info(f"Program Change: Preset {preset_num}")
+                    self.current_preset = preset_num
+                elif msg_data[0] == SYSEX_START:  # SysEx message
+                    logger.debug(f"SysEx message received: {msg_data}")
+                    self._sysex_responses.append((msg_data, time_stamp))
 
     def send_program_change(self, program_number, channel=0):
         """
@@ -148,6 +166,132 @@ class FCB1010:
                 f"Invalid controller ({controller}), value ({value}), or channel ({channel})"
             )
 
+    def send_sysex(self, data: List[int]) -> bool:
+        """
+        Send a SysEx message to the FCB1010.
+
+        Args:
+            data: List of bytes to send (without F0/F7, they will be added automatically)
+
+        Returns:
+            bool: True if message was sent successfully, False otherwise
+        """
+        try:
+            # Build complete sysex message
+            sysex_msg = [SYSEX_START]
+            sysex_msg.extend(FCB1010_MANUFACTURER_ID)
+            sysex_msg.append(FCB1010_DEVICE_ID)
+            sysex_msg.append(FCB1010_MODEL_ID)
+            sysex_msg.extend(data)
+            sysex_msg.append(SYSEX_END)
+
+            # Validate all bytes are in valid range (0-127)
+            if not all(0 <= byte <= 127 for byte in sysex_msg):
+                logger.error("Invalid sysex data: bytes must be in range 0-127")
+                return False
+
+            self.midi_out.send_message(sysex_msg)
+            logger.debug(f"Sent SysEx: {[hex(b) for b in sysex_msg]}")
+            return True
+        except Exception as e:
+            logger.error(f"Error sending sysex: {e}")
+            return False
+
+    def send_sysex_data(self, data: List[int]) -> bool:
+        """
+        Easy-to-use method to send raw sysex data to FCB1010.
+        This is a convenience wrapper around send_sysex().
+
+        Args:
+            data: List of data bytes to send (will be wrapped with FCB1010 sysex header)
+
+        Returns:
+            bool: True if sent successfully, False otherwise
+
+        Example:
+            >>> fcb = FCB1010()
+            >>> fcb.send_sysex_data([0x01, 0x02, 0x03])
+        """
+        return self.send_sysex(data)
+
+    def wait_for_sysex_response(self, timeout: Optional[float] = None) -> Optional[List[int]]:
+        """
+        Wait for a sysex response from the FCB1010.
+
+        Args:
+            timeout: Maximum time to wait in seconds (defaults to self._sysex_timeout)
+
+        Returns:
+            List of bytes from the sysex response, or None if timeout
+        """
+        if timeout is None:
+            timeout = self._sysex_timeout
+
+        start_time = time.time()
+        initial_response_count = len(self._sysex_responses)
+
+        while time.time() - start_time < timeout:
+            if len(self._sysex_responses) > initial_response_count:
+                response_data, _ = self._sysex_responses.pop(0)
+                # Validate and extract sysex data
+                if len(response_data) >= 2:
+                    if response_data[0] == SYSEX_START and response_data[-1] == SYSEX_END:
+                        # Remove F0 and F7, return data bytes
+                        return list(response_data[1:-1])
+                    else:
+                        logger.warning("Received invalid sysex message format")
+            time.sleep(0.01)
+
+        logger.warning(f"No sysex response received within {timeout} seconds")
+        return None
+
+    def read_preset_sysex(self, preset_number: int) -> Optional[List[int]]:
+        """
+        Read a preset from FCB1010 using sysex.
+
+        Args:
+            preset_number: Preset number to read (0-99)
+
+        Returns:
+            List of bytes from the preset data, or None if failed
+        """
+        if not 0 <= preset_number <= 99:
+            logger.error(f"Invalid preset number: {preset_number} (must be 0-99)")
+            return None
+
+        # Clear any pending responses
+        self._sysex_responses.clear()
+
+        # Build read preset command (command format may vary - this is a common pattern)
+        # Command byte 0x01 typically means "read preset"
+        command = [0x01, preset_number]
+
+        if self.send_sysex(command):
+            return self.wait_for_sysex_response()
+        return None
+
+    def write_preset_sysex(self, preset_number: int, preset_data: List[int]) -> bool:
+        """
+        Write preset data to FCB1010 using sysex.
+
+        Args:
+            preset_number: Preset number to write (0-99)
+            preset_data: List of bytes containing preset data
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not 0 <= preset_number <= 99:
+            logger.error(f"Invalid preset number: {preset_number} (must be 0-99)")
+            return False
+
+        # Build write preset command
+        # Command byte 0x02 typically means "write preset"
+        command = [0x02, preset_number]
+        command.extend(preset_data)
+
+        return self.send_sysex(command)
+
     def read_preset(self, preset_number):
         """
         Read preset data from the FCB1010.
@@ -158,27 +302,58 @@ class FCB1010:
         Returns:
             dict: Preset data or None if read failed
         """
-        # This would require implementation of MIDI SysEx messages for FCB1010
-        # The actual implementation depends on the FCB1010 SysEx specification
-        logger.info(f"Reading preset {preset_number}")
-        # Placeholder - actual implementation would send SysEx requests and process responses
-        return {"preset_number": preset_number, "name": f"Preset {preset_number}"}
+        logger.info(f"Reading preset {preset_number} via sysex")
+        sysex_data = self.read_preset_sysex(preset_number)
+
+        if sysex_data is None:
+            logger.warning(f"Failed to read preset {preset_number}")
+            return None
+
+        # Parse sysex data into preset structure
+        # This is a placeholder - actual parsing depends on FCB1010 sysex format
+        return {
+            "preset_number": preset_number,
+            "name": f"Preset {preset_number}",
+            "sysex_data": sysex_data,
+        }
 
     def write_preset(self, preset_data):
         """
         Write preset data to the FCB1010.
 
         Args:
-            preset_data (dict): Preset data to write
+            preset_data (dict): Preset data to write. Must contain 'preset_number'
+                                and optionally 'sysex_data' or other preset fields.
 
         Returns:
             bool: True if successful, False otherwise
         """
-        # This would require implementation of MIDI SysEx messages for FCB1010
         preset_number = preset_data.get("preset_number")
-        logger.info(f"Writing preset {preset_number}")
-        # Placeholder - actual implementation would format data and send SysEx messages
-        return True
+        if preset_number is None:
+            logger.error("preset_data must contain 'preset_number'")
+            return False
+
+        logger.info(f"Writing preset {preset_number} via sysex")
+
+        # Extract sysex data if provided, otherwise build from preset structure
+        if "sysex_data" in preset_data:
+            sysex_data = preset_data["sysex_data"]
+        else:
+            # Build sysex data from preset structure
+            # This is a placeholder - actual format depends on FCB1010 specification
+            sysex_data = []
+            # Add program changes
+            for pc in preset_data.get("program_changes", []):
+                sysex_data.extend([pc.get("program", 0), pc.get("channel", 0)])
+            # Add control changes
+            for cc in preset_data.get("control_changes", []):
+                sysex_data.extend([
+                    cc.get("controller", 0),
+                    cc.get("value", 0),
+                    cc.get("channel", 0)
+                ])
+
+        return self.write_preset_sysex(preset_number, sysex_data)
 
     def close(self):
         """
