@@ -9,6 +9,7 @@ Behringer FCB1010 MIDI foot controller.
 # Remove unused imports and fix import order
 import sys
 import json
+import time
 import logging
 from pathlib import Path
 

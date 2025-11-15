@@ -5,6 +5,7 @@ A Python library and command-line tool for editing and managing Behringer FCB101
 ## Features
 
 - Edit, save, and load FCB1010 presets
+- **SysEx interface for direct hardware communication**
 - Command-line interface for preset management
 - Send presets to hardware (requires connected FCB1010)
 - Google Sheets integration (optional)
@@ -38,10 +39,43 @@ A Python library and command-line tool for editing and managing Behringer FCB101
 
 ## Usage
 
+### Basic Usage
+
 - Run the CLI editor:
   ```sh
   python3 scripts/editor.py
   ```
+
+### SysEx Interface
+
+The library provides an easy-to-use SysEx interface for direct communication with the FCB1010:
+
+```python
+from src.fcb1010 import FCB1010
+
+# Connect to FCB1010
+fcb = FCB1010()
+
+# Send raw sysex data
+fcb.send_sysex_data([0x01, 0x02, 0x03])
+
+# Read preset via sysex
+preset_data = fcb.read_preset_sysex(0)
+
+# Write preset via sysex
+fcb.write_preset_sysex(0, [0x00, 0x01, 0x02])
+
+# Clean up
+fcb.close()
+```
+
+For more examples, see `scripts/sysex_example.py`:
+```sh
+python3 scripts/sysex_example.py
+```
+
+### Development
+
 - Run tests:
   ```sh
   make test
